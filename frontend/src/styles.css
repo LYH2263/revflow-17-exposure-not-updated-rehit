@@ -443,3 +443,25 @@ tbody tr:hover { background: rgba(36, 87, 197, 0.04); }
 }
 
 .muted-sub { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+
+/* 敞口配平证明：归并台展开行与小型按钮 */
+.btn-mini {
+  padding: 4px 10px;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.proof-row > td {
+  background: #f7fafc;
+  padding: 10px 14px;
+}
+.proof-table {
+  width: 100%;
+  border: 1px solid var(--line);
+}
+.proof-table th,
+.proof-table td {
+  padding: 7px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}

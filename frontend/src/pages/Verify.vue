@@ -65,7 +65,8 @@ function yuan(cents) {
         <thead>
           <tr>
             <th>#</th><th>归并#</th><th>流水净额</th><th>余额合计</th><th>已冲累计</th>
-            <th>剩余敞口（本轮/当前）</th><th>敞口不符</th><th>超额隔离</th><th>隔离数</th><th>一致</th><th>时间</th>
+            <th>剩余敞口（本轮/当前）</th><th>敞口不符</th><th>超额隔离</th>
+            <th>配平证明</th><th>证明不符</th><th>隔离数</th><th>一致</th><th>时间</th>
           </tr>
         </thead>
         <tbody>
@@ -81,6 +82,12 @@ function yuan(cents) {
             </td>
             <td>{{ (r.detail || {}).敞口不符数 }}</td>
             <td>{{ (r.detail || {}).本轮超额隔离笔数 }}</td>
+            <td>{{ (r.detail || {}).配平证明笔数 }}</td>
+            <td>
+              <span class="tag" :class="(r.detail || {}).证明不符数 ? 'bad' : 'on'">
+                {{ (r.detail || {}).证明不符数 }}
+              </span>
+            </td>
             <td>{{ r.quarantine_count }}</td>
             <td>
               <span class="tag" :class="r.consistent ? 'on' : 'bad'">
@@ -89,7 +96,7 @@ function yuan(cents) {
             </td>
             <td>{{ r.created_at }}</td>
           </tr>
-          <tr v-if="!rows.length"><td colspan="11">尚无报告</td></tr>
+          <tr v-if="!rows.length"><td colspan="13">尚无报告</td></tr>
         </tbody>
       </table>
     </div>

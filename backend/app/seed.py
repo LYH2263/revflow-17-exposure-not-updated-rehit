@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS settle_runs (
   excess_quarantine_count INTEGER NOT NULL DEFAULT 0,
   exposure_mismatch_count INTEGER NOT NULL DEFAULT 0,
   commit_mode TEXT NOT NULL DEFAULT '单事务',
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  proof_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS forward_exposures (
   forward_entry_key TEXT PRIMARY KEY REFERENCES ledger_entries(entry_key),
@@ -67,6 +68,20 @@ CREATE TABLE IF NOT EXISTS forward_exposures (
   last_reversal_key TEXT,
   last_settle_run_id INTEGER,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS exposure_settle_proofs (
+  id INTEGER PRIMARY KEY,
+  settle_run_id INTEGER NOT NULL REFERENCES settle_runs(id),
+  forward_entry_key TEXT NOT NULL REFERENCES ledger_entries(entry_key),
+  original_cents INTEGER NOT NULL,
+  before_reversed_cents INTEGER NOT NULL,
+  before_remaining_cents INTEGER NOT NULL,
+  after_reversed_cents INTEGER NOT NULL,
+  after_remaining_cents INTEGER NOT NULL,
+  applied_cents INTEGER NOT NULL DEFAULT 0,
+  excess_quarantine_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  UNIQUE(settle_run_id, forward_entry_key)
 );
 CREATE TABLE IF NOT EXISTS verify_reports (
   id INTEGER PRIMARY KEY,
@@ -93,6 +108,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("settle_runs", "exposure_mismatch_count", "INTEGER NOT NULL DEFAULT 0"),
     ("settle_runs", "commit_mode", "TEXT NOT NULL DEFAULT '单事务'"),
     ("settle_runs", "note", "TEXT NOT NULL DEFAULT ''"),
+    ("settle_runs", "proof_count", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

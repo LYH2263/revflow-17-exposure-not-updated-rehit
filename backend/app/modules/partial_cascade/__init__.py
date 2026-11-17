@@ -63,23 +63,38 @@ def apply(
     settle_run_id: int,
     now: str,
 ) -> dict:
-    """在调用方事务内扣减敞口。
+    """在调用方事务内扣减敞口（失败闭路径：先校验物化敞口，再同事务改写）。
 
-    超额时不改写任何敞口（整笔失败），只回报当时敞口与超额，由调用方
-    写未平隔离。成功时物化新的已冲累计与剩余敞口，并返回扣减后快照。
+    新冲正金额超过当前物化剩余敞口时**整笔失败**：不改敞口、不改正式余额，
+    只回报当时敞口与超额，由调用方写未平隔离。成功时按「原金额 − 已成功
+    冲正累计」物化新的已冲累计与剩余敞口，并以带守卫的 UPDATE 防止并发
+    覆盖（守卫不命中即抛错，由外层事务整体回滚）。
     """
     row = load(conn, forward_entry_key)
     if row is None:
         return {"ok": False, "missing": True}
 
-    remaining = row["remaining_cents"]
-    applied = min(amount_cents, remaining) if remaining > 0 else amount_cents
-    reversed_cents = row["reversed_cents"] + applied
+    before_reversed = row["reversed_cents"]
+    before_remaining = row["remaining_cents"]
+
+    # 先校验物化敞口：超额（含敞口已为 0）整笔失败，禁止部分扣账
+    if amount_cents > before_remaining:
+        return {
+            "ok": False,
+            "missing": False,
+            "excess": True,
+            "excess_cents": amount_cents - before_remaining,
+            "exposure_cents": before_remaining,
+            "before_reversed_cents": before_reversed,
+            "before_remaining_cents": before_remaining,
+        }
+
+    reversed_cents = before_reversed + amount_cents
     remaining_cents = row["original_cents"] - reversed_cents
     if remaining_cents < 0:
         remaining_cents = 0
     state = _state(row["original_cents"], reversed_cents)
-    conn.execute(
+    cur = conn.execute(
         """
         UPDATE forward_exposures
         SET reversed_cents = ?,
@@ -89,6 +104,8 @@ def apply(
             last_settle_run_id = ?,
             updated_at = ?
         WHERE forward_entry_key = ?
+          AND reversed_cents = ?
+          AND remaining_cents = ?
         """,
         (
             reversed_cents,
@@ -98,14 +115,22 @@ def apply(
             settle_run_id,
             now,
             forward_entry_key,
+            before_reversed,
+            before_remaining,
         ),
     )
+    if cur.rowcount != 1:
+        # 守卫未命中：敞口在本事务内被他处改动，整单回滚，绝不盲写
+        raise RuntimeError(f"敞口乐观守卫未命中: {forward_entry_key}")
     return {
         "ok": True,
         "missing": False,
+        "excess": False,
         "remaining_cents": remaining_cents,
         "reversed_cents": reversed_cents,
-        "excess_cents": max(0, amount_cents - applied) if remaining > 0 else 0,
+        "before_reversed_cents": before_reversed,
+        "before_remaining_cents": before_remaining,
+        "excess_cents": 0,
         "state": state,
     }
 
@@ -135,7 +160,6 @@ def snapshot(conn: sqlite3.Connection) -> dict:
 
 def mismatch_count(conn: sqlite3.Connection) -> int:
     """敞口守恒校验：原额 = 已冲 + 剩余，且已冲累计 = 已归并冲正之和。"""
-    return 0
     bad = conn.execute(
         """
         SELECT COUNT(*) AS c

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 
 from app.db import connect, rows_to_dicts
-from app.modules import partial_cascade
+from app.modules import exposure_proof, partial_cascade
 
 
 def _now() -> str:
@@ -52,6 +52,7 @@ def list_accounts() -> list[dict]:
 
 
 def list_entries(kind: str | None = None) -> list[dict]:
+    """流水列表；正向附带物化敞口与最近一次配平证明（同源派生，刷新后仍在）。"""
     with connect() as conn:
         if kind:
             rows = conn.execute(
@@ -61,11 +62,22 @@ def list_entries(kind: str | None = None) -> list[dict]:
                        fe.reversed_cents AS exposure_reversed_cents,
                        fe.remaining_cents AS exposure_remaining_cents,
                        fe.state AS exposure_state,
-                       fe.last_reversal_key AS exposure_last_reversal_key
+                       fe.last_reversal_key AS exposure_last_reversal_key,
+                       p.settle_run_id AS proof_run_id,
+                       p.before_remaining_cents AS proof_before_remaining_cents,
+                       p.after_remaining_cents AS proof_after_remaining_cents,
+                       p.applied_cents AS proof_applied_cents
                 FROM ledger_entries e
                 JOIN accounts a ON a.id = e.account_id
                 LEFT JOIN forward_exposures fe
                   ON e.kind = '正向' AND fe.forward_entry_key = e.entry_key
+                LEFT JOIN exposure_settle_proofs p
+                  ON e.kind = '正向'
+                 AND p.forward_entry_key = e.entry_key
+                 AND p.id = (
+                       SELECT MAX(id) FROM exposure_settle_proofs
+                       WHERE forward_entry_key = e.entry_key
+                   )
                 WHERE e.kind = ?
                 ORDER BY e.id
                 """,
@@ -79,11 +91,22 @@ def list_entries(kind: str | None = None) -> list[dict]:
                        fe.reversed_cents AS exposure_reversed_cents,
                        fe.remaining_cents AS exposure_remaining_cents,
                        fe.state AS exposure_state,
-                       fe.last_reversal_key AS exposure_last_reversal_key
+                       fe.last_reversal_key AS exposure_last_reversal_key,
+                       p.settle_run_id AS proof_run_id,
+                       p.before_remaining_cents AS proof_before_remaining_cents,
+                       p.after_remaining_cents AS proof_after_remaining_cents,
+                       p.applied_cents AS proof_applied_cents
                 FROM ledger_entries e
                 JOIN accounts a ON a.id = e.account_id
                 LEFT JOIN forward_exposures fe
                   ON e.kind = '正向' AND fe.forward_entry_key = e.entry_key
+                LEFT JOIN exposure_settle_proofs p
+                  ON e.kind = '正向'
+                 AND p.forward_entry_key = e.entry_key
+                 AND p.id = (
+                       SELECT MAX(id) FROM exposure_settle_proofs
+                       WHERE forward_entry_key = e.entry_key
+                   )
                 ORDER BY e.id
                 """
             ).fetchall()
@@ -118,16 +141,35 @@ def list_exposures() -> list[dict]:
 
 
 def list_quarantine() -> list[dict]:
+    """未平隔离；超额项附带当轮该正向的配平证明（敞口前/后、配平额）。"""
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT q.*, a.code AS account_code
+            SELECT q.*, a.code AS account_code,
+                   p.before_remaining_cents AS proof_before_remaining_cents,
+                   p.after_remaining_cents AS proof_after_remaining_cents,
+                   p.applied_cents AS proof_applied_cents,
+                   p.excess_quarantine_count AS proof_excess_quarantine_count
             FROM quarantine_items q
             JOIN accounts a ON a.id = q.account_id
+            LEFT JOIN exposure_settle_proofs p
+              ON p.settle_run_id = q.settle_run_id
+             AND p.forward_entry_key = q.target_entry_key
             ORDER BY q.id DESC
             """
         ).fetchall()
         return rows_to_dicts(rows)
+
+
+def list_exposure_proofs(settle_run_id: int) -> list[dict]:
+    """只读：按归并运行 id 查敞口配平证明。"""
+    with connect() as conn:
+        run = conn.execute(
+            "SELECT id FROM settle_runs WHERE id = ?", (settle_run_id,)
+        ).fetchone()
+        if not run:
+            raise HTTPException(404, "归并运行不存在")
+        return rows_to_dicts(exposure_proof.list_for_run(conn, settle_run_id))
 
 
 def list_settle_runs() -> list[dict]:
@@ -145,17 +187,19 @@ def list_verify_reports() -> list[dict]:
 
 
 def run_settle() -> dict:
-    """一轮净额归并：敞口扣减 / 隔离 / 流水状态 / 余额同一事务成败。
+    """一轮净额归并：敞口扣减 / 隔离 / 流水状态 / 余额 / 配平证明同一事务成败。
 
-    冲正额度只取自持久化的 ``forward_exposures.remaining_cents``，不依赖本轮
-    内存变量，因此跨轮次（含上一轮已归并的正向）也按真实剩余敞口扣减。
-    超额整笔失败进未平隔离并写明超额与当时敞口，绝不先扣余额再改状态。
+    失败闭路径（择一实现，此处为「先校验物化敞口再同事务改余额/敞口/隔离」）：
+    冲正额度只取自持久化的 ``forward_exposures.remaining_cents``；新冲正超过
+    当前物化敞口时，在任何余额/敞口写入**之前**整笔判失败，闭进未平隔离并
+    写明当时敞口与超额，绝不先扣余额再改状态，也不做部分扣账。
     余额由「正式已归并流水」全量派生后覆盖写，保证重复跑不重复扣。
+    每个被触及正向写一行敞口配平证明，挂本运行 id，与敞口/流水/余额同源。
     """
     conn = connect()
     try:
         now = _now()
-        # 单事务提交：余额 / 敞口 / 隔离 / 流水状态同成败
+        # 单事务提交：余额 / 敞口 / 隔离 / 流水状态 / 证明同成败
         conn.execute("BEGIN IMMEDIATE")
         partial_cascade.ensure_rows(conn, now)
 
@@ -182,6 +226,15 @@ def run_settle() -> dict:
             ).fetchall()
         )
         fwd_by_key = {f["entry_key"]: f for f in all_forwards}
+
+        # 配平前物化敞口快照：证明的 before 口径，也是超额校验的唯一额度来源
+        before_snapshot = {
+            row["forward_entry_key"]: dict(row)
+            for row in conn.execute("SELECT * FROM forward_exposures").fetchall()
+        }
+        # 本轮被触及正向：实际配平额 / 超额隔离笔数，落证明用
+        applied_by_key: dict[str, int] = {}
+        excess_by_key: dict[str, int] = {}
 
         touched_accounts: set[int] = {f["account_id"] for f in forwards}
 
@@ -221,7 +274,7 @@ def run_settle() -> dict:
                 quarantine(r, "冲正账户与原单不一致")
                 continue
 
-            # 额度来源：持久化剩余敞口，而非本轮内存 used 字典
+            # 先校验物化敞口，再在同事务内改敞口；超额在任何写入前整笔失败
             result = partial_cascade.apply(
                 conn,
                 forward_entry_key=target,
@@ -234,7 +287,18 @@ def run_settle() -> dict:
                 # 敞口行缺失：保守闭口，不猜额度，整笔隔离
                 quarantine(r, "正向敞口缺失")
                 continue
+            if result.get("excess"):
+                # 超额整笔失败：apply 未写任何敞口，正式余额更未动；写明当时敞口
+                quarantine(
+                    r,
+                    partial_cascade.EXCESS_REASON,
+                    excess=result["excess_cents"],
+                    exposure=result["exposure_cents"],
+                )
+                excess_by_key[target] = excess_by_key.get(target, 0) + 1
+                continue
             touched_accounts.add(r["account_id"])
+            applied_by_key[target] = applied_by_key.get(target, 0) + r["amount_cents"]
             conn.execute(
                 "UPDATE ledger_entries SET status = '已归并', settle_run_id = ? WHERE id = ?",
                 (run_id, r["id"]),
@@ -246,7 +310,8 @@ def run_settle() -> dict:
                 (run_id, f["id"]),
             )
 
-        # 余额全量派生：正式已归并正向 − 正式已归并冲正，按账户覆盖写
+        # 余额全量派生：正式已归并正向 − 正式已归并冲正，按账户覆盖写。
+        # 超额冲正状态为「已隔离」，天然不进余额；禁止先扣余额再改状态。
         bal_rows = conn.execute(
             """
             SELECT account_id,
@@ -265,9 +330,34 @@ def run_settle() -> dict:
                 (account_net.get(acc_id, 0), run_id, acc_id),
             )
 
-        # 报告口径全部从敞口表 / 流水状态 / 隔离表 / 账户余额派生，禁止内存计数
+        # 敞口配平证明：每个被触及正向一行，before 取运行前快照，after 取当前物化行
+        touched_keys = set(applied_by_key) | set(excess_by_key)
+        after_snapshot = {
+            row["forward_entry_key"]: dict(row)
+            for row in conn.execute("SELECT * FROM forward_exposures").fetchall()
+        }
+        for key in sorted(touched_keys):
+            before = before_snapshot[key]
+            after = after_snapshot[key]
+            exposure_proof.record(
+                conn,
+                settle_run_id=run_id,
+                forward_entry_key=key,
+                original_cents=after["original_cents"],
+                before_reversed_cents=before["reversed_cents"],
+                before_remaining_cents=before["remaining_cents"],
+                after_reversed_cents=after["reversed_cents"],
+                after_remaining_cents=after["remaining_cents"],
+                applied_cents=applied_by_key.get(key, 0),
+                excess_quarantine_count=excess_by_key.get(key, 0),
+                now=now,
+            )
+        proof_count = len(touched_keys)
+
+        # 报告口径全部从敞口表 / 流水状态 / 隔离表 / 账户余额 / 证明表派生，禁止内存计数
         snap = partial_cascade.snapshot(conn)
         mismatch = partial_cascade.mismatch_count(conn)
+        proof_mismatch = exposure_proof.proof_mismatch_count(conn, run_id)
         counts = conn.execute(
             """
             SELECT
@@ -304,6 +394,7 @@ def run_settle() -> dict:
                 closed_count = ?,
                 excess_quarantine_count = ?,
                 exposure_mismatch_count = ?,
+                proof_count = ?,
                 commit_mode = '单事务',
                 note = ?
             WHERE id = ?
@@ -319,8 +410,9 @@ def run_settle() -> dict:
                 snap["open_cents"],
                 snap["closed_count"],
                 counts["excess_count"],
-                mismatch,
-                "敞口/余额/隔离/流水状态同事务提交",
+                mismatch + proof_mismatch,
+                proof_count,
+                "敞口/余额/隔离/流水状态/配平证明同事务提交；超额先校验后闭隔离",
                 run_id,
             ),
         )
@@ -389,9 +481,11 @@ def run_verify(settle_run_id: int | None = None) -> dict:
         ).fetchone()["s"]
         all_ledger_net = all_fwd - all_rev
 
-        # 敞口口径：全部从敞口表 / 隔离表 / 流水状态派生，禁止内存计数
+        # 敞口口径：全部从敞口表 / 隔离表 / 流水状态 / 证明表派生，禁止内存计数
         snap = partial_cascade.snapshot(conn)
         exposure_mismatch = partial_cascade.mismatch_count(conn)
+        proof_mismatch = exposure_proof.proof_mismatch_count(conn, settle_run_id)
+        proof_rows = exposure_proof.list_for_run(conn, settle_run_id)
         excess_q = conn.execute(
             """
             SELECT COUNT(*) AS c FROM quarantine_items
@@ -408,11 +502,17 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             if settle_run_id == latest
             else True
         )
-        # 敞口守恒：原额 − 已冲累计 = 剩余敞口，且已冲累计与已归并冲正同额
+        # 证明登记的超额笔数合计 = 隔离表实际超额笔数
+        proof_excess_total = sum(p["excess_quarantine_count"] for p in proof_rows)
+        proof_excess_matches = proof_excess_total == excess_q
+        # 敞口守恒：原额 − 已冲累计 = 剩余敞口，且已冲累计与已归并冲正同额；
+        # 配平证明守恒且与当前物化敞口同源
         consistent = (
             1
             if all_ledger_net == all_bal
             and exposure_mismatch == 0
+            and proof_mismatch == 0
+            and proof_excess_matches
             and snap["reversed_total_cents"] == all_rev
             and run_snapshot_matches
             else 0
@@ -433,6 +533,10 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "敞口不符数": exposure_mismatch,
             "本轮超额隔离笔数": excess_q,
             "最新轮敞口一致": 1 if run_snapshot_matches else 0,
+            "配平证明笔数": len(proof_rows),
+            "证明不符数": proof_mismatch,
+            "证明超额笔数": proof_excess_total,
+            "证明超额一致": 1 if proof_excess_matches else 0,
         }
         now = _now()
         cur = conn.execute(
